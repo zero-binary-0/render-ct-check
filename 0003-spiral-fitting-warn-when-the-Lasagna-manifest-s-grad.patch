@@ -1,0 +1,160 @@
+From 1b742557e3df3d937ca6c7a74cd28750f16e3b99 Mon Sep 17 00:00:00 2001
+From: PATCH AUTHOR <author@example.invalid>
+Date: Tue, 17 Nov 2026 17:24:32 +0000
+Subject: [PATCH] spiral-fitting: warn when the Lasagna manifest's
+ grad_mag_factor differs from dense_grad_mag_factor
+
+The fit decodes grad_mag with the config value dense_grad_mag_factor
+(losses.py:1132; default 0.25, config.py:622) and does not read the
+grad_mag_factor the dataset's .lasagna.json manifest states
+(lasagna_source.read_lasagna_manifest keeps only the stores and the frame).
+The Lasagna volume schema (lasagna/docs/volume_schema_v3.md:131) says an
+existing grad_mag_factor 'MUST be preserved'. Published manifests state
+both 0.25 and 1.0, so with the default a dataset written with 1.0 is
+decoded at a quarter of its winding density, silently.
+
+This adds a warning only, printed once, naming both values and the config
+key, when a local manifest's factor differs from the configured one.
+Decoding is unchanged. Covered by tests/test_grad_mag_factor_warning.py
+(stdlib only, no GPU, no scroll data). A source document written by
+write_lasagna_source (the remote-copy route) carries no factor, so that
+route is not checked.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ spiral-fitting/fit_spiral.py                  |  5 +-
+ spiral-fitting/lasagna_source.py              | 44 ++++++++++++++++++
+ .../tests/test_grad_mag_factor_warning.py     | 46 +++++++++++++++++++
+ 3 files changed, 94 insertions(+), 1 deletion(-)
+ create mode 100644 spiral-fitting/tests/test_grad_mag_factor_warning.py
+
+diff --git a/spiral-fitting/fit_spiral.py b/spiral-fitting/fit_spiral.py
+index f304c6c..d5724da 100644
+--- a/spiral-fitting/fit_spiral.py
++++ b/spiral-fitting/fit_spiral.py
+@@ -67,7 +67,7 @@ def _startup_resource_suffix(started_at=None):
+ 
+ 
+ from lasagna_data import ensure_fit_sparse_stores, prepare_lasagna_volume
+-from lasagna_source import load_lasagna_source
++from lasagna_source import load_lasagna_source, warn_grad_mag_factor_mismatch
+ from checkpoint_io import load_checkpoint_cpu, model_state_sha256
+ from fiber_direction_samples import load_fiber_direction_samples
+ from spiral_sampling import load_spiral_sampling
+@@ -1101,6 +1101,9 @@ class FitContext:
+         # fit reads no Lasagna dataset.
+         if self.lasagna_source is not None:
+             self.scroll = scroll = resolve_lasagna_scale(scroll, self.lasagna_source)
++            if 'dense_grad_mag_factor' in config:
++                warn_grad_mag_factor_mismatch(
++                    paths.lasagna, config['dense_grad_mag_factor'])
+         self.lasagna_scale = (
+             int(scroll.lasagna_scale) if self.lasagna_source is not None else None)
+         self.build_lasagna_packs = bool(build_lasagna_packs)
+diff --git a/spiral-fitting/lasagna_source.py b/spiral-fitting/lasagna_source.py
+index a448424..42390dd 100644
+--- a/spiral-fitting/lasagna_source.py
++++ b/spiral-fitting/lasagna_source.py
+@@ -388,3 +388,47 @@ def fiber_directions_path(cache_directory: str | os.PathLike[str], identity: str
+         raise LasagnaSourceError(f"invalid fiber-direction scale {output_scale!r}")
+     return os.path.join(str(cache_directory), "fiber-directions", check_identity(identity),
+                         f"scale{float(output_scale):g}.npz")
++
++
++# The decode factor a manifest states, against the fit's configured one. The
++# fit decodes grad_mag with the config's dense_grad_mag_factor (losses.py);
++# the manifest's grad_mag_factor is not read, so a dataset written with
++# another factor is decoded silently at the wrong scale. This only warns.
++_GRAD_MAG_FACTOR_WARNED: set[tuple[str, float, float]] = set()
++
++
++def declared_grad_mag_factor(path: str | os.PathLike[str]) -> float | None:
++    """The ``grad_mag_factor`` a ``*.lasagna.json`` manifest states, or None
++    (a source document, a manifest without the key, or one that cannot be
++    read: the fit reports those itself)."""
++    try:
++        document = json.loads(Path(path).read_text())
++    except (OSError, ValueError):
++        return None
++    if not isinstance(document, Mapping) or document.get("format") == SOURCE_FORMAT:
++        return None
++    value = document.get("grad_mag_factor")
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        return None
++    return float(value) if math.isfinite(value) and value > 0 else None
++
++
++def warn_grad_mag_factor_mismatch(path: str | os.PathLike[str],
++                                  configured: float) -> bool:
++    """Print one warning when the manifest at ``path`` states a
++    ``grad_mag_factor`` other than ``configured`` (dense_grad_mag_factor).
++    Returns whether it warned. Behaviour is unchanged: the fit still decodes
++    with the configured value."""
++    declared = declared_grad_mag_factor(path)
++    if declared is None or math.isclose(declared, float(configured), rel_tol=1e-9):
++        return False
++    key = (str(path), declared, float(configured))
++    if key in _GRAD_MAG_FACTOR_WARNED:
++        return False
++    _GRAD_MAG_FACTOR_WARNED.add(key)
++    print(f"WARNING: the Lasagna manifest {path} states grad_mag_factor={declared:g}, "
++          f"but the fit decodes grad_mag with dense_grad_mag_factor={float(configured):g} "
++          f"(config key 'dense_grad_mag_factor'); the winding density is scaled by "
++          f"{float(configured) / declared:g}. Set dense_grad_mag_factor to {declared:g} "
++          f"if the manifest's value is the right one.")
++    return True
+diff --git a/spiral-fitting/tests/test_grad_mag_factor_warning.py b/spiral-fitting/tests/test_grad_mag_factor_warning.py
+new file mode 100644
+index 0000000..90f9103
+--- /dev/null
++++ b/spiral-fitting/tests/test_grad_mag_factor_warning.py
+@@ -0,0 +1,46 @@
++"""The fit warns once when a Lasagna manifest's grad_mag_factor differs from
++the configured dense_grad_mag_factor (decoding itself is unchanged)."""
++import json
++
++import lasagna_source
++from lasagna_source import declared_grad_mag_factor, warn_grad_mag_factor_mismatch
++
++
++def write_manifest(directory, name='s.lasagna.json', **extra):
++    document = {'version': 2, 'grad_mag_encode_scale': 1000.0, 'groups': {
++        channel: {'zarr': f's_{channel}.ome.zarr/4', 'scaledown': 4, 'channels': [channel]}
++        for channel in ('nx', 'ny', 'grad_mag')}, **extra}
++    path = directory / name
++    path.write_text(json.dumps(document))
++    return path
++
++
++def test_a_differing_factor_warns_once_naming_both_values_and_the_key(tmp_path, capsys, monkeypatch):
++    monkeypatch.setattr(lasagna_source, '_GRAD_MAG_FACTOR_WARNED', set())
++    path = write_manifest(tmp_path, grad_mag_factor=1.0)
++    assert declared_grad_mag_factor(path) == 1.0
++    assert warn_grad_mag_factor_mismatch(path, 0.25) is True
++    out = capsys.readouterr().out
++    assert 'grad_mag_factor=1' in out and 'dense_grad_mag_factor=0.25' in out
++    assert "'dense_grad_mag_factor'" in out
++    assert warn_grad_mag_factor_mismatch(path, 0.25) is False      # once
++    assert capsys.readouterr().out == ''
++
++
++def test_an_equal_or_absent_factor_is_silent(tmp_path, capsys, monkeypatch):
++    monkeypatch.setattr(lasagna_source, '_GRAD_MAG_FACTOR_WARNED', set())
++    same = write_manifest(tmp_path, name='same.lasagna.json', grad_mag_factor=0.25)
++    absent = write_manifest(tmp_path, name='absent.lasagna.json')
++    assert warn_grad_mag_factor_mismatch(same, 0.25) is False
++    assert declared_grad_mag_factor(absent) is None
++    assert warn_grad_mag_factor_mismatch(absent, 0.25) is False
++    assert capsys.readouterr().out == ''
++
++
++def test_a_source_document_or_bad_value_is_not_read_as_a_factor(tmp_path):
++    source = tmp_path / 'source.json'
++    source.write_text(json.dumps({'format': lasagna_source.SOURCE_FORMAT, 'grad_mag_factor': 1.0}))
++    assert declared_grad_mag_factor(source) is None
++    for bad in (True, 'x', -1.0, 0):
++        assert declared_grad_mag_factor(write_manifest(tmp_path, name=f'b{bad!s}.lasagna.json', grad_mag_factor=bad)) is None
++    assert declared_grad_mag_factor(tmp_path / 'missing.lasagna.json') is None
+-- 
+2.39.5
+
